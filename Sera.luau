@@ -1,6 +1,10 @@
 --!strict
 --!native
 -- Low-level schematized serialization library
+--
+-- Notes:
+-- Delta serialization has an additional size cost of (n + 1) bytes where "n" is the number of fields present
+-- in a table that's being serialized (1 byte for present field count, 1 enumerating byte for each field)
 
 -- Imports when running via lune
 local _, Roblox = pcall(require, "@lune/roblox")
@@ -49,28 +53,28 @@ type Field<T> = {
 	des: Des<T>,
 }
 
---- An array of various fields
+--- An array of fields.
 type Fields = { Field<any> }
 
---- A lookup table from keys to fields
+--- A lookup table that maps string keys to fields.
 type FieldLookup = { [string]: Field<any> }
 
---- A schema used to serialize and deserialize data that contains many fields.
+--- A schema used to serialize and deserialize data that contains various fields.
 export type Schema = {
 	fields: Fields,
 	fieldLookup: FieldLookup,
 }
 
---- Size for the large buffer that Serialize writes to
--- NOTE: "Serialize" and "DeltaSerialize" will fail if resulting buffer size is larger than this value
+--- Size of the large buffer that Serialize writes to
+-- NOTE: "Serialize" and "DeltaSerialize" will fail if resulting buffer size is larger than this value.
 local BIG_BUFFER_SIZE = 1000000
 
---- Sizes for strings and buffers
+--- Sizes for strings and buffers.
 local SIZE_8 = 2 ^ 8 - 1
 local SIZE_16 = 2 ^ 16 - 1
 local SIZE_32 = 2 ^ 32 - 1
 
---- The maximum number of fields a schema can have
+--- The maximum number of fields that a schema can have.
 local MAX_FIELDS = 2 ^ 8 - 1
 
 --- Big reusable buffer
@@ -83,12 +87,12 @@ local RAD2 = math.pi * 2
 local ANGLE8RANGE = math.rad(359)
 
 --- Encode an angle (0-360) into integer form (0-255)
-local function RadEncode(angle: number): number
+function RadEncode(angle: number): number
 	return math.round((angle % RAD2) * 255 / ANGLE8RANGE)
 end
 
 --- A lookup table that decodes encoded radians.
---- degDecodeLookup[encoded] = decoded
+--- radDecodeLookup[encoded] = decoded
 local radDecodeLookup: NumberMap = {}
 do
 	-- Populate degDecodeLookup
@@ -458,7 +462,7 @@ local SERA_TYPES = table.freeze {
 
 --- Serialize values from table `input` onto buffer `buf` at offset `offset` based on serialization scheme `schema`.
 ---
---- Will fail if fields from `schema` are missing from table `input`.
+--- Serializes correctly when all fields are present (non-schema fields are ignored, missing fields will throw an error).
 ---
 --- Serialization may throw an error! Wrap in `pcall`.
 ---
@@ -475,7 +479,7 @@ end
 
 --- Delta-serialize values from table `input` onto buffer `buf` at offset `offset` based on serialization scheme `schema`.
 ---
---- Will fail if extra fields are present in `input` that aren't in `schema`.
+--- Will serialize when only some fields are present (non-schema fields will throw an error).
 ---
 --- Serialization may throw an error! Wrap in `pcall`.
 ---
@@ -525,7 +529,7 @@ function GetSerializationError(schema: Schema, input: SchemaSerializeInput, buf:
 			return `Couldn't serialize field '{field.key}' (Expected: '{field.name}'; Got: '{typeof(value)}'; Message: '{offset}')`
 		end
 	end
-	return `Unknown error`
+	return "Unknown error"
 end
 
 --- Validates a delta serialization of table `input` onto buffer `buf` based on serialization scheme `schema`.
@@ -549,16 +553,36 @@ function GetDeltaSerializationError(schema: Schema, input: SchemaSerializeInput,
 			return `Couldn't serialize field '{field.key}' (Expected: {field.name}; Got: '{typeof(inputValue)}'; Message: {offset})`
 		end
 	end
-	return `Unknown error`
+	return "Unknown error"
 end
 
+--- A low-level schematized serialization library for Luau
+---
+--- Read the documentation [here](https://github.com/constellationz/Sera/blob/main/README.md)
 local Sera = {
 	Types = SERA_TYPES,
 }
 
+--- Deserialize values from `buf` at offset `offset` based on deserialization scheme `schema`
+---
+--- If the buffer doesn't contain all fields from the schema, this deserialization will return an incorrect result
+---
+--- ```luau
+--- return result, offset
+--- ```
+function Sera.Deserialize(schema: Schema, buf: buffer, offset: number): (SchemaDeserializeResult, number)
+	-- Read all fields one-by-one into result
+	local result: SchemaDeserializeResult = {}
+	for _, field in schema.fields do
+		local fieldKey = field.key
+		result[fieldKey], offset = field.des(buf, offset)
+	end
+	return result, offset
+end
+
 --- Returns a new buffer `buf` serialized from table `input` based on serialization scheme `schema`.
 ---
---- Will error if `input` is missing any fields from `schema`.
+--- Serializes correctly when all fields are present (non-schema fields are ignored, missing fields will throw an error).
 ---
 --- If serialization fails, `buf` is nil and `err` is a string containing the error message.
 ---
@@ -578,9 +602,51 @@ function Sera.Serialize(schema: Schema, input: SchemaSerializeInput): (buffer?, 
 	return buf, nil
 end
 
+--- Push values from table `input` onto buffer `buf` at byte `offset` based on serialization scheme `schema`.
+---
+--- Serializes correctly when all fields are present (non-schema fields are ignored, missing fields will throw an error).
+---
+--- Returns new buffer offset after serialization or error message if fail.
+---
+--- ```luau
+--- return offset, err
+--- ```
+function Sera.Push(schema: Schema, input: SchemaSerializeInput, buf: buffer, offset: number): (number?, string?)
+	local success, newOffset = pcall(SerializeUnsafe, schema, input, buf, offset)
+	if not success then
+		return nil, GetSerializationError(schema, input, buf, offset)
+	end
+	return newOffset, nil
+end
+
+--- Deserialize values from `buf` at offset `offset` based on deserialization scheme `schema`
+---
+--- Will serialize when only some fields are present (non-schema fields will throw an error).
+---
+--- ```luau
+--- return result, offset
+--- ```
+function Sera.DeltaDeserialize(schema: Schema, buf: buffer, offset: number): (SchemaDeserializeResult, number)
+	-- The field count is at the first position
+	local fieldCount = buffer.readu8(buf, offset)
+
+	-- All other values are red at the offset after the fieldCount
+	offset += 1
+
+	-- Get field values, insert them into result
+	local fieldLookup = schema.fields
+	local result: SchemaDeserializeResult = {}
+	for _ = 1, fieldCount do
+		local field = fieldLookup[buffer.readu8(buf, offset)]
+		local fieldKey = field.key
+		result[fieldKey], offset = field.des(buf, offset + 1)
+	end
+	return result, offset
+end
+
 --- Returns a new buffer `buf` delta-serialized from table `input` based on serialization scheme `schema`.
 ---
---- `input` can have fields missing from `schema` but may not have extraneous fields.
+--- Will serialize when only some fields are present (non-schema fields will throw an error).
 ---
 --- If serialization fails, `buf` is nil and `err` is a string containing the error message.
 ---
@@ -602,59 +668,19 @@ end
 
 --- Push values from table `input` onto buffer `buf` at byte `offset` based on serialization scheme `schema`.
 ---
---- Will fail if fields from `schema` are missing from table `input`.
+--- Will serialize when only some fields are present (non-schema fields will throw an error).
 ---
 --- Returns new buffer offset after serialization or error message if fail.
 ---
 --- ```luau
 --- return offset, err
 --- ```
-function Sera.Push(schema: Schema, input: SchemaSerializeInput, buf: buffer, offset: number): (number?, string?)
-	local success, newOffset = pcall(SerializeUnsafe, schema, input, buf, offset)
-	if not success then
-		return nil, GetSerializationError(schema, input, buf, offset)
-	end
-	return newOffset, nil
-end
-
---- Pushes serialized deltas to an existing buffer.
---- Returns new buffer offset or error message if fail.
 function Sera.DeltaPush(schema: Schema, input: SchemaSerializeInput, buf: buffer, offset: number): (number?, string?)
 	local success, newOffset = pcall(DeltaSerializeUnsafe, schema, input, buf, offset)
 	if not success then
 		return nil, GetDeltaSerializationError(schema, input, buf, offset)
 	end
 	return newOffset, nil
-end
-
---- Returns dictionary of deserialized schema.
-function Sera.Deserialize(schema: Schema, buf: buffer, offset: number): (SchemaDeserializeResult, number)
-	-- Read all fields one-by-one into result
-	local result: SchemaDeserializeResult = {}
-	for _, field in schema.fields do
-		local fieldKey = field.key
-		result[fieldKey], offset = field.des(buf, offset)
-	end
-	return result, offset
-end
-
---- Returns dictionary of deserialized deltas.
-function Sera.DeltaDeserialize(schema: Schema, buf: buffer, offset: number): (SchemaDeserializeResult, number)
-	-- The field count is at the first position
-	local fieldCount = buffer.readu8(buf, offset)
-
-	-- All other values are red at the offset after the fieldCount
-	offset += 1
-
-	-- Get field values, insert them into result
-	local fieldLookup = schema.fields
-	local result: SchemaDeserializeResult = {}
-	for _ = 1, fieldCount do
-		local field = fieldLookup[buffer.readu8(buf, offset)]
-		local fieldKey = field.key
-		result[fieldKey], offset = field.des(buf, offset + 1)
-	end
-	return result, offset
 end
 
 --- Create a deserialization schema with a type map `schemaKey`.
